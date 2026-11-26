@@ -1,0 +1,6 @@
+{
+  "name": "J.A.R.V.I.S. AI HUD",
+  "description": "Futuristic holographic personal AI assistant interface powered by Google Gemini, real-time audio visualization, telemetry, and voice control.",
+  "requestFramePermissions": ["microphone", "camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
