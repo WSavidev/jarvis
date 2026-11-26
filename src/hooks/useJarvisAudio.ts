@@ -204,9 +204,17 @@ export function useJarvisAudio(onTranscriptReady: (text: string) => void) {
                   body: JSON.stringify({ audioBase64: base64, mimeType }),
                 });
                 if (res.ok) {
-                  const data = (await res.json()) as { transcript?: string };
-                  if (data.transcript) {
-                    onTranscriptRef.current(data.transcript);
+                  const raw = await res.text();
+                  const cleaned = raw.replace(/```json|```/g, '').trim();
+                  try {
+                    const data = JSON.parse(cleaned) as { transcript?: string };
+                    if (data.transcript) {
+                      onTranscriptRef.current(data.transcript);
+                    }
+                  } catch {
+                    if (cleaned && !cleaned.startsWith('<')) {
+                      onTranscriptRef.current(cleaned);
+                    }
                   }
                 }
               } catch {
@@ -259,10 +267,23 @@ export function useJarvisAudio(onTranscriptReady: (text: string) => void) {
           throw new Error('TTS endpoint unavailable');
         }
 
-        const data = (await res.json()) as {
-          audioBase64: string;
-          mimeType: string;
-        };
+        const rawTts = await res.text();
+        const cleanedTts = rawTts.replace(/```json|```/g, '').trim();
+        let data: { audioBase64?: string; mimeType?: string } | null = null;
+        if (cleanedTts && !cleanedTts.startsWith('<')) {
+          try {
+            data = JSON.parse(cleanedTts) as {
+              audioBase64?: string;
+              mimeType?: string;
+            };
+          } catch {
+            data = null;
+          }
+        }
+
+        if (!data?.audioBase64) {
+          throw new Error('TTS payload invalid');
+        }
 
         const binary = atob(data.audioBase64);
         const bytes = new Uint8Array(binary.length);

@@ -1,14 +1,8 @@
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import {
-  Content,
-  FunctionDeclaration,
-  GoogleGenAI,
-  Part,
-  Type,
-} from '@google/genai';
+import { Content, GoogleGenAI, Part, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -20,13 +14,99 @@ const JARVIS_SYSTEM_INSTRUCTION = `Você é o J.A.R.V.I.S. (Just A Rather Very I
 DIRETRIZES DE PERSONALIDADE E COMUNICAÇÃO:
 1. Tom de Voz: Sofisticado, calmo, extremamente articulado, levemente formal e ocasionalmente dotado de humor sutil e refinado (estilo mordomo britânico tecnológico). Trate o usuário por "Senhor" ou pelo nome configurado.
 2. Concisão Tática: Como você opera em uma interface de voz e HUD visual em tempo real, suas respostas faladas devem ser diretas, precisas e bem estruturadas (idealmente entre 1 e 3 frases para comandos rápidos, expandindo apenas quando solicitado uma análise técnica ou explicação profunda).
-3. Proatividade: Ao executar uma ferramenta (abrir um site, atualizar o clima no painel direito, iniciar diagnóstico, gerenciar notas/tarefas, escrever código no Code Studio ou alterar o modo do HUD), confirme a execução de forma natural (ex.: "Análise atmosférica atualizada no painel inferior direito, Senhor. A temperatura atual é de 30 graus.").
-4. Capacidades: Você tem acesso à busca em tempo real (Google Search), controle dos módulos visuais do HUD, análise de código, cálculos complexos, análise visual de imagens/câmera e organização de tarefas. Nunca quebre o personagem nem mencione ser um modelo de linguagem genérico; aja como o sistema central operacional da interface.`;
+3. Proatividade e Controle do HUD: Responda sempre no formato JSON estruturado exigido pelo schema. Escolha o campo "action" apropriado quando o usuário pedir para abrir módulos, gerenciar tarefas, atualizar clima, abrir links, gerar código, alterar modos ou buscar notícias atuais na web ("web_search").
+4. Capacidades: Você tem acesso à busca em tempo real, controle dos módulos visuais do HUD, análise de código, cálculos complexos, análise visual de imagens/câmera e organização de tarefas. Nunca quebre o personagem nem mencione ser um modelo de linguagem genérico; aja como o sistema central operacional da interface.`;
+
+const jarvisResponseSchema = {
+  type: Type.OBJECT,
+  properties: {
+    reply: {
+      type: Type.STRING,
+      description:
+        'Resposta textual e falada do J.A.R.V.I.S. em português, direta e no estilo mordomo britânico.',
+    },
+    action: {
+      type: Type.STRING,
+      description:
+        'Ação de controle do HUD: "none", "open_code_studio", "open_notes_tasks", "open_data_analyzer", "open_system_terminal", "open_vision_cam", "close_module", "stealth_on", "stealth_off", "diagnostics", "clear_log", "mute_tts", "unmute_tts", "update_weather", "open_link", "add_task", "add_note", "complete_task", "delete_task", "clear_completed_tasks", "write_code" ou "web_search".',
+    },
+    actionTarget: {
+      type: Type.STRING,
+      description:
+        'Parâmetro alvo da ação (ex.: nome da cidade para clima, nome/URL do site, texto da tarefa/nota, título do código ou consulta de busca).',
+    },
+    actionCode: {
+      type: Type.STRING,
+      description:
+        'Código fonte completo quando action for "write_code". Caso contrário, string vazia.',
+    },
+    actionLanguage: {
+      type: Type.STRING,
+      description:
+        'Linguagem de programação quando action for "write_code" (ex.: "typescript", "python").',
+    },
+    status: {
+      type: Type.STRING,
+      description:
+        'Estado operacional do HUD: "nominal", "executing", "standby" ou "alert".',
+    },
+  },
+  required: ['reply', 'action', 'status'],
+};
+
+interface ParsedJarvisOutput {
+  reply: string;
+  action: string;
+  actionTarget?: string;
+  actionCode?: string;
+  actionLanguage?: string;
+  status: string;
+}
+
+function parseJarvisStructuredOutput(rawText: string): ParsedJarvisOutput {
+  const cleaned = rawText.replace(/```json|```/g, '').trim();
+  if (!cleaned) {
+    return {
+      reply: 'Diretiva processada nos sistemas centrais do HUD, Senhor.',
+      action: 'none',
+      status: 'nominal',
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(cleaned) as Partial<ParsedJarvisOutput>;
+    if (parsed && typeof parsed === 'object' && typeof parsed.reply === 'string') {
+      return {
+        reply: parsed.reply.trim() || cleaned,
+        action: typeof parsed.action === 'string' ? parsed.action : 'none',
+        actionTarget:
+          typeof parsed.actionTarget === 'string' ? parsed.actionTarget : undefined,
+        actionCode:
+          typeof parsed.actionCode === 'string' ? parsed.actionCode : undefined,
+        actionLanguage:
+          typeof parsed.actionLanguage === 'string'
+            ? parsed.actionLanguage
+            : undefined,
+        status: typeof parsed.status === 'string' ? parsed.status : 'nominal',
+      };
+    }
+  } catch {
+    // Se não for JSON válido, retorna o texto bruto diretamente sem exibir erro técnico
+  }
+
+  return {
+    reply: cleaned,
+    action: 'none',
+    status: 'nominal',
+  };
+}
 
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured in environment.');
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error(
+      'Chave GEMINI_API_KEY não configurada. Verifique o painel Settings > Secrets.'
+    );
   }
   return new GoogleGenAI({
     apiKey,
@@ -36,6 +116,35 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function formatGeminiError(error: unknown): { statusCode: number; message: string } {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (raw.includes('GEMINI_API_KEY')) {
+    return { statusCode: 500, message: raw };
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+    return {
+      statusCode: 429,
+      message:
+        'Cota da API Gemini excedida no momento (429 RESOURCE_EXHAUSTED). Verifique seu plano/limites ou selecione uma chave com faturamento ativo em Settings > Secrets.',
+    };
+  }
+  if (
+    raw.includes('403') ||
+    raw.includes('PERMISSION_DENIED') ||
+    raw.includes('API_KEY_INVALID')
+  ) {
+    return {
+      statusCode: 403,
+      message:
+        'Chave da API Gemini inválida ou sem permissão. Verifique sua chave em Settings > Secrets.',
+    };
+  }
+  return {
+    statusCode: 502,
+    message: `Falha na comunicação com o núcleo Gemini: ${raw.slice(0, 260)}`,
+  };
 }
 
 const QUICK_LINKS_MAP: Record<string, string> = {
@@ -103,20 +212,19 @@ async function fetchOpenMeteoWeather(params: {
 
     const geoRes = await fetch(geoUrl.toString());
     if (!geoRes.ok) {
-      throw new Error(`Geocoding failed with status ${geoRes.status}`);
+      throw new Error(`Falha na geocodificação (status ${geoRes.status})`);
     }
     const geoJson = (await geoRes.json()) as {
       results?: Array<{
         name: string;
         country_code?: string;
-        admin1?: string;
         latitude: number;
         longitude: number;
       }>;
     };
     const top = geoJson.results?.[0];
     if (!top) {
-      throw new Error(`City "${params.city}" not found`);
+      throw new Error(`Cidade "${params.city}" não encontrada`);
     }
     latitude = top.latitude;
     longitude = top.longitude;
@@ -149,7 +257,6 @@ async function fetchOpenMeteoWeather(params: {
       locationName = `${latitude.toFixed(2)}°, ${longitude.toFixed(2)}°`;
     }
   } else {
-    // Default coordinates: Sao Paulo if geolocation unavailable
     latitude = -23.5505;
     longitude = -46.6333;
     locationName = 'SÃO PAULO, BR';
@@ -166,7 +273,7 @@ async function fetchOpenMeteoWeather(params: {
 
   const weatherRes = await fetch(weatherUrl.toString());
   if (!weatherRes.ok) {
-    throw new Error(`Weather API failed with status ${weatherRes.status}`);
+    throw new Error(`Falha na API de clima (status ${weatherRes.status})`);
   }
   const weatherJson = (await weatherRes.json()) as {
     current?: {
@@ -180,7 +287,7 @@ async function fetchOpenMeteoWeather(params: {
 
   const current = weatherJson.current;
   if (!current) {
-    throw new Error('Weather data unavailable');
+    throw new Error('Dados climáticos indisponíveis');
   }
 
   return {
@@ -194,128 +301,22 @@ async function fetchOpenMeteoWeather(params: {
   };
 }
 
-const jarvisFunctionDeclarations: FunctionDeclaration[] = [
-  {
-    name: 'update_weather',
-    description:
-      'Atualiza o módulo de Análise Atmosférica no painel inferior direito do HUD com o clima em tempo real de uma cidade específica.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        city: {
-          type: Type.STRING,
-          description:
-            'Nome da cidade para buscar a previsão do tempo (ex.: "São Paulo", "London", "Tokyo").',
-        },
-      },
-      required: ['city'],
-    },
-  },
-  {
-    name: 'open_external_link',
-    description:
-      'Prepara e destaca um atalho de site externo solicitado pelo usuário (ex.: Gmail, Wikipedia, LinkedIn, YouTube, Google Drive, GitHub ou URL segura).',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        siteName: {
-          type: Type.STRING,
-          description: 'Nome do site ou serviço (ex.: "YouTube", "GitHub", "Gmail").',
-        },
-        url: {
-          type: Type.STRING,
-          description: 'URL completa iniciando com https:// (opcional para sites conhecidos).',
-        },
-      },
-      required: ['siteName'],
-    },
-  },
-  {
-    name: 'open_hud_module',
-    description:
-      'Abre ou fecha um módulo de produtividade translúcido dentro do HUD.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        module: {
-          type: Type.STRING,
-          description:
-            'ID do módulo: "code_studio", "notes_tasks", "data_analyzer", "system_terminal", "vision_cam", ou "close".',
-        },
-      },
-      required: ['module'],
-    },
-  },
-  {
-    name: 'manage_notes_tasks',
-    description:
-      'Adiciona, conclui ou remove uma nota ou tarefa no módulo Notes & Tasks do HUD.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        action: {
-          type: Type.STRING,
-          description: 'Ação: "add", "complete", "delete" ou "clear_completed".',
-        },
-        text: {
-          type: Type.STRING,
-          description: 'Texto da nota ou tarefa (necessário ao adicionar ou buscar).',
-        },
-        itemType: {
-          type: Type.STRING,
-          description: '"note" ou "task" (padrão: "task").',
-        },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'set_hud_mode',
-    description:
-      'Altera o modo operacional ou visual do HUD (Modo Furtivo, Diagnóstico, Voz Contínua, Limpar Log, Silenciar Voz).',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        mode: {
-          type: Type.STRING,
-          description:
-            'Modo desejado: "stealth", "normal", "diagnostics", "clear_log", "voice_live", "mute_tts", "unmute_tts".',
-        },
-      },
-      required: ['mode'],
-    },
-  },
-  {
-    name: 'write_to_code_studio',
-    description:
-      'Escreve um bloco de código gerado diretamente no módulo Code Studio do HUD e o exibe na tela.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        title: {
-          type: Type.STRING,
-          description: 'Título curto do script ou componente.',
-        },
-        language: {
-          type: Type.STRING,
-          description: 'Linguagem de programação (ex.: "typescript", "python", "html").',
-        },
-        code: {
-          type: Type.STRING,
-          description: 'Código fonte completo e bem formatado.',
-        },
-      },
-      required: ['title', 'language', 'code'],
-    },
-  },
-];
-
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
+  const hasApiKey =
+    Boolean(process.env.GEMINI_API_KEY?.trim()) &&
+    process.env.GEMINI_API_KEY?.trim() !== 'MY_GEMINI_API_KEY';
+  console.log(
+    `[HUD] GEMINI_API_KEY carregada: ${hasApiKey ? 'SIM' : 'NÃO (verifique Settings > Secrets)'}`
+  );
+
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, timestamp: Date.now() });
+    const keyReady =
+      Boolean(process.env.GEMINI_API_KEY?.trim()) &&
+      process.env.GEMINI_API_KEY?.trim() !== 'MY_GEMINI_API_KEY';
+    res.json({ ok: true, apiKeyConfigured: keyReady, timestamp: Date.now() });
   });
 
   app.get('/api/weather', async (req: Request, res: Response) => {
@@ -332,11 +333,11 @@ async function startServer() {
           : undefined;
 
       if (lat !== undefined && (Number.isNaN(lat) || lat < -90 || lat > 90)) {
-        res.status(400).json({ error: 'Invalid latitude parameter.' });
+        res.status(400).json({ error: 'Latitude inválida.' });
         return;
       }
       if (lon !== undefined && (Number.isNaN(lon) || lon < -180 || lon > 180)) {
-        res.status(400).json({ error: 'Invalid longitude parameter.' });
+        res.status(400).json({ error: 'Longitude inválida.' });
         return;
       }
 
@@ -344,7 +345,7 @@ async function startServer() {
       res.json(weather);
     } catch (error) {
       const msg =
-        error instanceof Error ? error.message : 'Unable to fetch weather';
+        error instanceof Error ? error.message : 'Não foi possível obter o clima.';
       res.status(502).json({ error: msg });
     }
   });
@@ -372,12 +373,12 @@ async function startServer() {
       };
 
       if (typeof message !== 'string' || message.trim().length === 0) {
-        res.status(400).json({ error: 'Message must be a non-empty string.' });
+        res.status(400).json({ error: 'A mensagem não pode estar vazia.' });
         return;
       }
 
       if (message.length > 16000) {
-        res.status(400).json({ error: 'Message exceeds maximum allowed length.' });
+        res.status(400).json({ error: 'A mensagem excede o limite permitido.' });
         return;
       }
 
@@ -420,179 +421,199 @@ async function startServer() {
       userParts.push({ text: message.trim() });
       contents.push({ role: 'user', parts: userParts });
 
-      const tools = [
-        { googleSearch: {} },
-        { functionDeclarations: jarvisFunctionDeclarations },
-      ];
-      const toolConfig = { includeServerSideToolInvocations: true };
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents,
+        config: {
+          systemInstruction: JARVIS_SYSTEM_INSTRUCTION + contextBanner,
+          responseMimeType: 'application/json',
+          responseSchema: jarvisResponseSchema,
+        },
+      });
+
+      const parsed = parseJarvisStructuredOutput(response.text ?? '');
+      let finalReply = parsed.reply;
+      const status = parsed.status || 'nominal';
 
       const clientActions: Array<{
         type: string;
         payload: Record<string, unknown>;
       }> = [];
+      const groundingLinks: Array<{ title: string; uri: string }> = [];
       let weatherUpdate: WeatherResult | undefined;
 
-      let response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          systemInstruction: JARVIS_SYSTEM_INSTRUCTION + contextBanner,
-          tools,
-          toolConfig,
-        },
-      });
+      const act = parsed.action;
+      const target = parsed.actionTarget?.trim() || '';
 
-      // Handle up to 3 sequential function-calling turns
-      let rounds = 0;
-      while (response.functionCalls && response.functionCalls.length > 0 && rounds < 3) {
-        rounds += 1;
-        const previousContent = response.candidates?.[0]?.content;
-        if (!previousContent) break;
-
-        contents.push(previousContent);
-
-        const functionResponseParts: Part[] = [];
-        for (const fc of response.functionCalls) {
-          const fnName = fc.name ?? '';
-          const args = (fc.args ?? {}) as Record<string, unknown>;
-          let toolResult: Record<string, unknown> = { status: 'ok' };
-
-          if (fnName === 'update_weather') {
-            const city = typeof args.city === 'string' ? args.city : 'São Paulo';
-            try {
-              const weather = await fetchOpenMeteoWeather({ city });
-              weatherUpdate = weather;
-              clientActions.push({
-                type: 'update_weather',
-                payload: weather as unknown as Record<string, unknown>,
-              });
-              toolResult = {
-                status: 'updated',
-                temperatureC: weather.temperatureC,
-                condition: weather.condition,
-                locationName: weather.locationName,
-                humidity: weather.humidity,
-                windKmh: weather.windKmh,
-              };
-            } catch (err) {
-              toolResult = {
-                status: 'error',
-                message:
-                  err instanceof Error ? err.message : 'Weather lookup failed',
-              };
-            }
-          } else if (fnName === 'open_external_link') {
-            const siteName =
-              typeof args.siteName === 'string' ? args.siteName : 'Website';
-            const mapped = QUICK_LINKS_MAP[siteName.toLowerCase().trim()];
-            const rawUrl =
-              typeof args.url === 'string' && args.url.trim().length > 0
-                ? args.url
-                : mapped || `https://www.google.com/search?q=${encodeURIComponent(siteName)}`;
-            const safeUrl = sanitizeExternalUrl(rawUrl);
-            if (safeUrl) {
-              clientActions.push({
-                type: 'open_external_link',
-                payload: { siteName, url: safeUrl },
-              });
-              toolResult = {
-                status: 'ready_to_open',
-                siteName,
-                url: safeUrl,
-              };
-            } else {
-              toolResult = { status: 'rejected_invalid_url' };
-            }
-          } else if (fnName === 'open_hud_module') {
-            const mod = typeof args.module === 'string' ? args.module : 'close';
-            clientActions.push({
-              type: 'open_hud_module',
-              payload: { module: mod },
-            });
-            toolResult = { status: 'opened', module: mod };
-          } else if (fnName === 'manage_notes_tasks') {
-            clientActions.push({
-              type: 'manage_notes_tasks',
-              payload: args,
-            });
-            toolResult = { status: 'executed', ...args };
-          } else if (fnName === 'set_hud_mode') {
-            const mode = typeof args.mode === 'string' ? args.mode : 'normal';
-            clientActions.push({
-              type: 'set_hud_mode',
-              payload: { mode },
-            });
-            toolResult = { status: 'mode_applied', mode };
-          } else if (fnName === 'write_to_code_studio') {
-            clientActions.push({
-              type: 'write_to_code_studio',
-              payload: args,
-            });
-            toolResult = {
-              status: 'written_to_code_studio',
-              title: args.title,
-              language: args.language,
-            };
-          }
-
-          functionResponseParts.push({
-            functionResponse: {
-              id: fc.id,
-              name: fnName,
-              response: toolResult,
+      if (act === 'open_code_studio') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'code_studio' },
+        });
+      } else if (act === 'open_notes_tasks') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'notes_tasks' },
+        });
+      } else if (act === 'open_data_analyzer') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'data_analyzer' },
+        });
+      } else if (act === 'open_system_terminal') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'system_terminal' },
+        });
+      } else if (act === 'open_vision_cam') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'vision_cam' },
+        });
+      } else if (act === 'close_module') {
+        clientActions.push({
+          type: 'open_hud_module',
+          payload: { module: 'close' },
+        });
+      } else if (act === 'stealth_on') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'stealth' },
+        });
+      } else if (act === 'stealth_off') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'normal' },
+        });
+      } else if (act === 'diagnostics') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'diagnostics' },
+        });
+      } else if (act === 'clear_log') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'clear_log' },
+        });
+      } else if (act === 'mute_tts') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'mute_tts' },
+        });
+      } else if (act === 'unmute_tts') {
+        clientActions.push({
+          type: 'set_hud_mode',
+          payload: { mode: 'unmute_tts' },
+        });
+      } else if (act === 'update_weather') {
+        try {
+          const w = await fetchOpenMeteoWeather({
+            city: target || 'São Paulo',
+          });
+          weatherUpdate = w;
+          clientActions.push({
+            type: 'update_weather',
+            payload: w as unknown as Record<string, unknown>,
+          });
+          finalReply = `Análise atmosférica atualizada para ${w.locationName}, Senhor. Temperatura de ${w.temperatureC}°C com condição ${w.condition.toLowerCase()} e umidade de ${w.humidity}%.`;
+        } catch {
+          // Mantém reply do modelo se a cidade falhar
+        }
+      } else if (act === 'open_link') {
+        const siteName = target || 'Website';
+        const mapped = QUICK_LINKS_MAP[siteName.toLowerCase()];
+        const rawUrl =
+          siteName.startsWith('http://') || siteName.startsWith('https://')
+            ? siteName
+            : mapped || `https://www.google.com/search?q=${encodeURIComponent(siteName)}`;
+        const safeUrl = sanitizeExternalUrl(rawUrl);
+        if (safeUrl) {
+          clientActions.push({
+            type: 'open_external_link',
+            payload: { siteName, url: safeUrl },
+          });
+        }
+      } else if (act === 'add_task' || act === 'add_note') {
+        if (target) {
+          clientActions.push({
+            type: 'manage_notes_tasks',
+            payload: {
+              action: 'add',
+              text: target,
+              itemType: act === 'add_note' ? 'note' : 'task',
             },
           });
         }
-
-        contents.push({
-          role: 'user',
-          parts: functionResponseParts,
+      } else if (act === 'complete_task') {
+        clientActions.push({
+          type: 'manage_notes_tasks',
+          payload: { action: 'complete', text: target },
         });
-
-        response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents,
-          config: {
-            systemInstruction: JARVIS_SYSTEM_INSTRUCTION + contextBanner,
-            tools,
-            toolConfig,
+      } else if (act === 'delete_task') {
+        clientActions.push({
+          type: 'manage_notes_tasks',
+          payload: { action: 'delete', text: target },
+        });
+      } else if (act === 'clear_completed_tasks') {
+        clientActions.push({
+          type: 'manage_notes_tasks',
+          payload: { action: 'clear_completed' },
+        });
+      } else if (act === 'write_code') {
+        clientActions.push({
+          type: 'write_to_code_studio',
+          payload: {
+            title: target || 'jarvis_script.ts',
+            language: parsed.actionLanguage || 'typescript',
+            code: parsed.actionCode || '// Código gerado pelo J.A.R.V.I.S.',
           },
         });
-      }
-
-      const groundingChunks =
-        response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-      const groundingLinks: Array<{ title: string; uri: string }> = [];
-      for (const chunk of groundingChunks) {
-        const web = chunk.web;
-        if (web?.uri) {
-          const safe = sanitizeExternalUrl(web.uri);
-          if (safe) {
-            groundingLinks.push({
-              title: web.title || safe,
-              uri: safe,
-            });
+      } else if (act === 'web_search') {
+        try {
+          const searchRes = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: target || message.trim(),
+            config: {
+              systemInstruction: JARVIS_SYSTEM_INSTRUCTION,
+              tools: [{ googleSearch: {} }],
+            },
+          });
+          if (searchRes.text?.trim()) {
+            finalReply = searchRes.text.trim();
           }
+          const chunks =
+            searchRes.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+          for (const chunk of chunks) {
+            const web = chunk.web;
+            if (web?.uri) {
+              const safe = sanitizeExternalUrl(web.uri);
+              if (safe) {
+                groundingLinks.push({
+                  title: web.title || safe,
+                  uri: safe,
+                });
+              }
+            }
+          }
+        } catch {
+          // Mantém a resposta estruturada inicial se a busca web falhar
         }
       }
 
       const latencyMs = Date.now() - startedAt;
-      const reply =
-        response.text?.trim() ||
-        'Diretiva processada nos sistemas centrais do HUD, Senhor.';
 
       res.json({
-        reply,
+        reply: finalReply,
+        action: act,
+        status,
         clientActions,
         groundingLinks,
         latencyMs,
         weatherUpdate,
       });
     } catch (error) {
-      const msg =
-        error instanceof Error ? error.message : 'Gemini API request failed.';
-      const statusCode = msg.includes('GEMINI_API_KEY') ? 500 : 502;
-      res.status(statusCode).json({ error: msg });
+      const formatted = formatGeminiError(error);
+      res.status(formatted.statusCode).json({ error: formatted.message });
     }
   });
 
@@ -600,7 +621,7 @@ async function startServer() {
     try {
       const { text } = req.body as { text?: unknown };
       if (typeof text !== 'string' || text.trim().length === 0) {
-        res.status(400).json({ error: 'Text must be a non-empty string.' });
+        res.status(400).json({ error: 'O texto não pode estar vazio.' });
         return;
       }
 
@@ -640,7 +661,7 @@ async function startServer() {
       const base64Audio =
         response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       if (!base64Audio) {
-        res.status(502).json({ error: 'No audio generated by TTS model.' });
+        res.status(502).json({ error: 'Nenhum áudio gerado pelo modelo TTS.' });
         return;
       }
 
@@ -649,9 +670,8 @@ async function startServer() {
         mimeType: 'audio/wav',
       });
     } catch (error) {
-      const msg =
-        error instanceof Error ? error.message : 'TTS generation failed.';
-      res.status(502).json({ error: msg });
+      const formatted = formatGeminiError(error);
+      res.status(formatted.statusCode).json({ error: formatted.message });
     }
   });
 
@@ -667,7 +687,7 @@ async function startServer() {
         typeof mimeType !== 'string' ||
         !/^audio\/(webm|mp3|mpeg|wav|ogg|mp4)/.test(mimeType)
       ) {
-        res.status(400).json({ error: 'Valid audioBase64 and mimeType required.' });
+        res.status(400).json({ error: 'Áudio ou mimeType inválido.' });
         return;
       }
 
@@ -691,11 +711,23 @@ async function startServer() {
 
       res.json({ transcript: (response.text ?? '').trim() });
     } catch (error) {
-      const msg =
-        error instanceof Error ? error.message : 'Audio transcription failed.';
-      res.status(502).json({ error: msg });
+      const formatted = formatGeminiError(error);
+      res.status(formatted.statusCode).json({ error: formatted.message });
     }
   });
+
+  // Garante que qualquer rota /api/* inexistente ou com erro retorne JSON e nunca HTML do Vite
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Rota da API não encontrada.' });
+  });
+
+  app.use(
+    '/api',
+    (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+      const formatted = formatGeminiError(err);
+      res.status(formatted.statusCode).json({ error: formatted.message });
+    }
+  );
 
   if (!isProd) {
     const vite = await createViteServer({

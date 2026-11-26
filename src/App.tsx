@@ -200,6 +200,17 @@ export default function App() {
     }
   }, []);
 
+  const parseWeatherSafe = async (res: Response): Promise<WeatherData | null> => {
+    const raw = await res.text();
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    if (!cleaned || cleaned.startsWith('<')) return null;
+    try {
+      return JSON.parse(cleaned) as WeatherData;
+    } catch {
+      return null;
+    }
+  };
+
   const syncWeather = useCallback(async (city?: string) => {
     setWeatherLoading(true);
     try {
@@ -208,8 +219,8 @@ export default function App() {
           `/api/weather?city=${encodeURIComponent(city)}`
         );
         if (!res.ok) throw new Error('Falha ao buscar clima da cidade.');
-        const data = (await res.json()) as WeatherData;
-        setWeather(data);
+        const data = await parseWeatherSafe(res);
+        if (data) setWeather(data);
         return;
       }
 
@@ -232,14 +243,14 @@ export default function App() {
           : '/api/weather';
         const res = await fetch(query);
         if (res.ok) {
-          const data = (await res.json()) as WeatherData;
-          setWeather(data);
+          const data = await parseWeatherSafe(res);
+          if (data) setWeather(data);
         }
       } else {
         const res = await fetch('/api/weather');
         if (res.ok) {
-          const data = (await res.json()) as WeatherData;
-          setWeather(data);
+          const data = await parseWeatherSafe(res);
+          if (data) setWeather(data);
         }
       }
     } catch {
@@ -433,26 +444,49 @@ export default function App() {
           }),
         });
 
-        const data = (await res.json()) as JarvisChatResponse & {
-          error?: string;
-        };
+        const rawBody = await res.text();
+        const cleanedBody = rawBody.replace(/```json|```/g, '').trim();
+        const looksLikeHtml =
+          cleanedBody.startsWith('<!') || cleanedBody.startsWith('<html');
 
-        if (!res.ok) {
-          throw new Error(data.error || 'Erro ao comunicar com o núcleo Gemini.');
+        let data: (JarvisChatResponse & { error?: string }) | null = null;
+        if (cleanedBody && !looksLikeHtml) {
+          try {
+            data = JSON.parse(cleanedBody) as JarvisChatResponse & {
+              error?: string;
+            };
+          } catch {
+            data = null;
+          }
         }
 
-        if (typeof data.latencyMs === 'number') {
+        if (!res.ok) {
+          const errText =
+            data?.error ||
+            (looksLikeHtml
+              ? `O servidor retornou uma resposta inesperada (HTTP ${res.status}). Verifique se o backend está ativo.`
+              : cleanedBody || `Erro na comunicação com o núcleo Gemini (HTTP ${res.status}).`);
+          throw new Error(errText);
+        }
+
+        const replyText =
+          data?.reply?.trim() ||
+          (!looksLikeHtml && cleanedBody
+            ? cleanedBody
+            : 'Diretiva processada nos sistemas centrais do HUD, Senhor.');
+
+        if (typeof data?.latencyMs === 'number') {
           setLatencyMs(data.latencyMs);
         }
 
-        const quickLinkAction = applyClientActions(data.clientActions || []);
+        const quickLinkAction = applyClientActions(data?.clientActions || []);
 
         const jarvisMsg: ChatMessage = {
           id: `j-${Date.now()}`,
           role: 'jarvis',
-          text: data.reply,
+          text: replyText,
           timestamp: formatShortTime(new Date()),
-          groundingLinks: data.groundingLinks,
+          groundingLinks: data?.groundingLinks,
           quickLinkAction,
         };
 
@@ -460,11 +494,11 @@ export default function App() {
         setTerminalLines((prev) => [
           ...prev.slice(-30),
           `> ${trimmed}`,
-          `[J.A.R.V.I.S.] ${data.reply}`,
+          `[J.A.R.V.I.S.] ${replyText}`,
         ]);
 
         if (ttsEnabled) {
-          speakText(data.reply);
+          speakText(replyText);
         }
       } catch (err) {
         const errMsg =
